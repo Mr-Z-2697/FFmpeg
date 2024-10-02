@@ -66,11 +66,15 @@ static void remove_sps(HEVCParamSets *s, int id)
 {
     int i;
     if (s->sps_list[id]) {
+        if (s->sps == s->sps_list[id])
+            s->sps = NULL;
+
         /* drop all PPS that depend on this SPS */
         for (i = 0; i < FF_ARRAY_ELEMS(s->pps_list); i++)
             if (s->pps_list[i] && s->pps_list[i]->sps_id == id)
                 ff_refstruct_unref(&s->pps_list[i]);
 
+        av_assert0(!(s->sps_list[id] && s->sps == s->sps_list[id]));
         ff_refstruct_unref(&s->sps_list[id]);
     }
 }
@@ -79,6 +83,9 @@ static void remove_vps(HEVCParamSets *s, int id)
 {
     int i;
     if (s->vps_list[id]) {
+        if (s->vps == s->vps_list[id])
+            s->vps = NULL;
+
         for (i = 0; i < FF_ARRAY_ELEMS(s->sps_list); i++)
             if (s->sps_list[i] && s->sps_list[i]->vps_id == id)
                 remove_sps(s, i);
@@ -1148,12 +1155,12 @@ static int map_pixel_format(AVCodecContext *avctx, HEVCSPS *sps)
 }
 
 int ff_hevc_parse_sps(HEVCSPS *sps, GetBitContext *gb, unsigned int *sps_id,
-                      unsigned nuh_layer_id, int apply_defdispwin,
-                      const HEVCVPS * const *vps_list, AVCodecContext *avctx)
+                      int apply_defdispwin, const HEVCVPS * const *vps_list,
+                      AVCodecContext *avctx)
 {
     HEVCWindow *ow;
     int ret = 0;
-    int bit_depth_chroma, num_comps, multi_layer_ext;
+    int bit_depth_chroma, start, num_comps;
     int i;
 
     // Coded parameters
@@ -1170,29 +1177,16 @@ int ff_hevc_parse_sps(HEVCSPS *sps, GetBitContext *gb, unsigned int *sps_id,
     }
 
     sps->max_sub_layers = get_bits(gb, 3) + 1;
-    multi_layer_ext = nuh_layer_id > 0 &&
-                      sps->max_sub_layers == HEVC_MAX_SUB_LAYERS + 1;
-    if (multi_layer_ext) {
-        if (!sps->vps)
-            return AVERROR(EINVAL);
-
-        sps->max_sub_layers = sps->vps->vps_max_sub_layers;
-    }
     if (sps->max_sub_layers > HEVC_MAX_SUB_LAYERS) {
         av_log(avctx, AV_LOG_ERROR, "sps_max_sub_layers out of range: %d\n",
                sps->max_sub_layers);
         return AVERROR_INVALIDDATA;
     }
 
-    if (!multi_layer_ext) {
-        sps->temporal_id_nesting = get_bits(gb, 1);
+    sps->temporal_id_nesting = get_bits(gb, 1);
 
-        if ((ret = parse_ptl(gb, avctx, 1, &sps->ptl, sps->max_sub_layers)) < 0)
-            return ret;
-    } else {
-        sps->temporal_id_nesting = sps->max_sub_layers > 1 ?
-                                   sps->vps->vps_max_sub_layers : 1;
-    }
+    if ((ret = parse_ptl(gb, avctx, 1, &sps->ptl, sps->max_sub_layers)) < 0)
+        return ret;
 
     *sps_id = get_ue_golomb_long(gb);
     if (*sps_id >= HEVC_MAX_SPS_COUNT) {
@@ -1200,94 +1194,70 @@ int ff_hevc_parse_sps(HEVCSPS *sps, GetBitContext *gb, unsigned int *sps_id,
         return AVERROR_INVALIDDATA;
     }
 
-    if (multi_layer_ext) {
-        const RepFormat *rf = &sps->vps->rep_format;
-
-        if (get_bits1(gb) &&    // update_rep_format_flag
-            get_bits(gb, 8)) {  // sps_rep_format_idx
-            av_log(avctx, AV_LOG_ERROR, "sps_rep_format_idx!=0\n");
-            return AVERROR_PATCHWELCOME;
-        }
-
-        sps->separate_colour_plane = rf->separate_colour_plane_flag;
-        sps->chroma_format_idc     = sps->separate_colour_plane ? 0 :
-                                     rf->chroma_format_idc;
-        sps->bit_depth             = rf->bit_depth_luma;
-        sps->width                 = rf->pic_width_in_luma_samples;
-        sps->height                = rf->pic_height_in_luma_samples;
-
-        sps->pic_conf_win.left_offset   = rf->conf_win_left_offset;
-        sps->pic_conf_win.right_offset  = rf->conf_win_right_offset;
-        sps->pic_conf_win.top_offset    = rf->conf_win_top_offset;
-        sps->pic_conf_win.bottom_offset = rf->conf_win_bottom_offset;
-
-    } else {
-        sps->chroma_format_idc = get_ue_golomb_long(gb);
-        if (sps->chroma_format_idc > 3U) {
-            av_log(avctx, AV_LOG_ERROR, "chroma_format_idc %d is invalid\n", sps->chroma_format_idc);
-            return AVERROR_INVALIDDATA;
-        }
-
-        if (sps->chroma_format_idc == 3)
-            sps->separate_colour_plane = get_bits1(gb);
-
-        if (sps->separate_colour_plane)
-            sps->chroma_format_idc = 0;
-
-        sps->width  = get_ue_golomb_long(gb);
-        sps->height = get_ue_golomb_long(gb);
-        if ((ret = av_image_check_size(sps->width,
-                                       sps->height, 0, avctx)) < 0)
-            return ret;
-
-        sps->conformance_window = get_bits1(gb);
-        if (sps->conformance_window) {
-            int vert_mult  = hevc_sub_height_c[sps->chroma_format_idc];
-            int horiz_mult = hevc_sub_width_c[sps->chroma_format_idc];
-            sps->pic_conf_win.left_offset   = get_ue_golomb_long(gb) * horiz_mult;
-            sps->pic_conf_win.right_offset  = get_ue_golomb_long(gb) * horiz_mult;
-            sps->pic_conf_win.top_offset    = get_ue_golomb_long(gb) *  vert_mult;
-            sps->pic_conf_win.bottom_offset = get_ue_golomb_long(gb) *  vert_mult;
-
-            if (avctx->flags2 & AV_CODEC_FLAG2_IGNORE_CROP) {
-                av_log(avctx, AV_LOG_DEBUG,
-                       "discarding sps conformance window, "
-                       "original values are l:%u r:%u t:%u b:%u\n",
-                       sps->pic_conf_win.left_offset,
-                       sps->pic_conf_win.right_offset,
-                       sps->pic_conf_win.top_offset,
-                       sps->pic_conf_win.bottom_offset);
-
-                sps->pic_conf_win.left_offset   =
-                sps->pic_conf_win.right_offset  =
-                sps->pic_conf_win.top_offset    =
-                sps->pic_conf_win.bottom_offset = 0;
-            }
-        }
-
-        sps->bit_depth = get_ue_golomb_31(gb) + 8;
-        if (sps->bit_depth > 16) {
-            av_log(avctx, AV_LOG_ERROR, "Luma bit depth (%d) is out of range\n",
-                   sps->bit_depth);
-            return AVERROR_INVALIDDATA;
-        }
-        bit_depth_chroma = get_ue_golomb_31(gb) + 8;
-        if (bit_depth_chroma > 16) {
-            av_log(avctx, AV_LOG_ERROR, "Chroma bit depth (%d) is out of range\n",
-                   bit_depth_chroma);
-            return AVERROR_INVALIDDATA;
-        }
-        if (sps->chroma_format_idc && bit_depth_chroma != sps->bit_depth) {
-            av_log(avctx, AV_LOG_ERROR,
-                   "Luma bit depth (%d) is different from chroma bit depth (%d), "
-                   "this is unsupported.\n",
-                   sps->bit_depth, bit_depth_chroma);
-            return AVERROR_INVALIDDATA;
-        }
-        sps->bit_depth_chroma = bit_depth_chroma;
+    sps->chroma_format_idc = get_ue_golomb_long(gb);
+    if (sps->chroma_format_idc > 3U) {
+        av_log(avctx, AV_LOG_ERROR, "chroma_format_idc %d is invalid\n", sps->chroma_format_idc);
+        return AVERROR_INVALIDDATA;
     }
 
-    sps->output_window = sps->pic_conf_win;
+    if (sps->chroma_format_idc == 3)
+        sps->separate_colour_plane = get_bits1(gb);
+
+    if (sps->separate_colour_plane)
+        sps->chroma_format_idc = 0;
+
+    sps->width  = get_ue_golomb_long(gb);
+    sps->height = get_ue_golomb_long(gb);
+    if ((ret = av_image_check_size(sps->width,
+                                   sps->height, 0, avctx)) < 0)
+        return ret;
+
+    sps->conformance_window = get_bits1(gb);
+    if (sps->conformance_window) {
+        int vert_mult  = hevc_sub_height_c[sps->chroma_format_idc];
+        int horiz_mult = hevc_sub_width_c[sps->chroma_format_idc];
+        sps->pic_conf_win.left_offset   = get_ue_golomb_long(gb) * horiz_mult;
+        sps->pic_conf_win.right_offset  = get_ue_golomb_long(gb) * horiz_mult;
+        sps->pic_conf_win.top_offset    = get_ue_golomb_long(gb) *  vert_mult;
+        sps->pic_conf_win.bottom_offset = get_ue_golomb_long(gb) *  vert_mult;
+
+        if (avctx->flags2 & AV_CODEC_FLAG2_IGNORE_CROP) {
+            av_log(avctx, AV_LOG_DEBUG,
+                   "discarding sps conformance window, "
+                   "original values are l:%u r:%u t:%u b:%u\n",
+                   sps->pic_conf_win.left_offset,
+                   sps->pic_conf_win.right_offset,
+                   sps->pic_conf_win.top_offset,
+                   sps->pic_conf_win.bottom_offset);
+
+            sps->pic_conf_win.left_offset   =
+            sps->pic_conf_win.right_offset  =
+            sps->pic_conf_win.top_offset    =
+            sps->pic_conf_win.bottom_offset = 0;
+        }
+        sps->output_window = sps->pic_conf_win;
+    }
+
+    sps->bit_depth = get_ue_golomb_31(gb) + 8;
+    if (sps->bit_depth > 16) {
+        av_log(avctx, AV_LOG_ERROR, "Luma bit depth (%d) is out of range\n",
+               sps->bit_depth);
+        return AVERROR_INVALIDDATA;
+    }
+    bit_depth_chroma = get_ue_golomb_31(gb) + 8;
+    if (bit_depth_chroma > 16) {
+        av_log(avctx, AV_LOG_ERROR, "Chroma bit depth (%d) is out of range\n",
+               bit_depth_chroma);
+        return AVERROR_INVALIDDATA;
+    }
+    if (sps->chroma_format_idc && bit_depth_chroma != sps->bit_depth) {
+        av_log(avctx, AV_LOG_ERROR,
+               "Luma bit depth (%d) is different from chroma bit depth (%d), "
+               "this is unsupported.\n",
+               sps->bit_depth, bit_depth_chroma);
+        return AVERROR_INVALIDDATA;
+    }
+    sps->bit_depth_chroma = bit_depth_chroma;
 
     ret = map_pixel_format(avctx, sps);
     if (ret < 0)
@@ -1300,43 +1270,33 @@ int ff_hevc_parse_sps(HEVCSPS *sps, GetBitContext *gb, unsigned int *sps_id,
         return AVERROR_INVALIDDATA;
     }
 
-    if (!multi_layer_ext) {
-        int start;
-
-        sps->sublayer_ordering_info = get_bits1(gb);
-        start = sps->sublayer_ordering_info ? 0 : sps->max_sub_layers - 1;
-        for (i = start; i < sps->max_sub_layers; i++) {
-            sps->temporal_layer[i].max_dec_pic_buffering = get_ue_golomb_long(gb) + 1;
-            sps->temporal_layer[i].num_reorder_pics      = get_ue_golomb_long(gb);
-            sps->temporal_layer[i].max_latency_increase  = get_ue_golomb_long(gb) - 1;
-            if (sps->temporal_layer[i].max_dec_pic_buffering > (unsigned)HEVC_MAX_DPB_SIZE) {
-                av_log(avctx, AV_LOG_ERROR, "sps_max_dec_pic_buffering_minus1 out of range: %d\n",
-                       sps->temporal_layer[i].max_dec_pic_buffering - 1U);
+    sps->sublayer_ordering_info = get_bits1(gb);
+    start = sps->sublayer_ordering_info ? 0 : sps->max_sub_layers - 1;
+    for (i = start; i < sps->max_sub_layers; i++) {
+        sps->temporal_layer[i].max_dec_pic_buffering = get_ue_golomb_long(gb) + 1;
+        sps->temporal_layer[i].num_reorder_pics      = get_ue_golomb_long(gb);
+        sps->temporal_layer[i].max_latency_increase  = get_ue_golomb_long(gb) - 1;
+        if (sps->temporal_layer[i].max_dec_pic_buffering > (unsigned)HEVC_MAX_DPB_SIZE) {
+            av_log(avctx, AV_LOG_ERROR, "sps_max_dec_pic_buffering_minus1 out of range: %d\n",
+                   sps->temporal_layer[i].max_dec_pic_buffering - 1U);
+            return AVERROR_INVALIDDATA;
+        }
+        if (sps->temporal_layer[i].num_reorder_pics > sps->temporal_layer[i].max_dec_pic_buffering - 1) {
+            av_log(avctx, AV_LOG_WARNING, "sps_max_num_reorder_pics out of range: %d\n",
+                   sps->temporal_layer[i].num_reorder_pics);
+            if (avctx->err_recognition & AV_EF_EXPLODE ||
+                sps->temporal_layer[i].num_reorder_pics > HEVC_MAX_DPB_SIZE - 1) {
                 return AVERROR_INVALIDDATA;
             }
-            if (sps->temporal_layer[i].num_reorder_pics > sps->temporal_layer[i].max_dec_pic_buffering - 1) {
-                av_log(avctx, AV_LOG_WARNING, "sps_max_num_reorder_pics out of range: %d\n",
-                       sps->temporal_layer[i].num_reorder_pics);
-                if (avctx->err_recognition & AV_EF_EXPLODE ||
-                    sps->temporal_layer[i].num_reorder_pics > HEVC_MAX_DPB_SIZE - 1) {
-                    return AVERROR_INVALIDDATA;
-                }
-                sps->temporal_layer[i].max_dec_pic_buffering = sps->temporal_layer[i].num_reorder_pics + 1;
-            }
+            sps->temporal_layer[i].max_dec_pic_buffering = sps->temporal_layer[i].num_reorder_pics + 1;
         }
+    }
 
-        if (!sps->sublayer_ordering_info) {
-            for (i = 0; i < start; i++) {
-                sps->temporal_layer[i].max_dec_pic_buffering = sps->temporal_layer[start].max_dec_pic_buffering;
-                sps->temporal_layer[i].num_reorder_pics      = sps->temporal_layer[start].num_reorder_pics;
-                sps->temporal_layer[i].max_latency_increase  = sps->temporal_layer[start].max_latency_increase;
-            }
-        }
-    } else {
-        for (int i = 0; i < sps->max_sub_layers; i++) {
-            sps->temporal_layer[i].max_dec_pic_buffering = sps->vps->dpb_size.max_dec_pic_buffering;
-            sps->temporal_layer[i].num_reorder_pics      = sps->vps->dpb_size.max_num_reorder_pics;
-            sps->temporal_layer[i].max_latency_increase  = sps->vps->dpb_size.max_latency_increase;
+    if (!sps->sublayer_ordering_info) {
+        for (i = 0; i < start; i++) {
+            sps->temporal_layer[i].max_dec_pic_buffering = sps->temporal_layer[start].max_dec_pic_buffering;
+            sps->temporal_layer[i].num_reorder_pics      = sps->temporal_layer[start].num_reorder_pics;
+            sps->temporal_layer[i].max_latency_increase  = sps->temporal_layer[start].max_latency_increase;
         }
     }
 
@@ -1374,11 +1334,6 @@ int ff_hevc_parse_sps(HEVCSPS *sps, GetBitContext *gb, unsigned int *sps_id,
     sps->scaling_list_enabled = get_bits1(gb);
     if (sps->scaling_list_enabled) {
         set_default_scaling_list_data(&sps->scaling_list);
-
-        if (multi_layer_ext && get_bits1(gb)) { // sps_infer_scaling_list_flag
-            av_log(avctx, AV_LOG_ERROR, "sps_infer_scaling_list_flag=1 not supported\n");
-            return AVERROR_PATCHWELCOME;
-        }
 
         if (get_bits1(gb)) {
             ret = scaling_list_data(gb, avctx, &sps->scaling_list, sps);
@@ -1634,8 +1589,7 @@ static int compare_sps(const HEVCSPS *sps1, const HEVCSPS *sps2)
 }
 
 int ff_hevc_decode_nal_sps(GetBitContext *gb, AVCodecContext *avctx,
-                           HEVCParamSets *ps, unsigned nuh_layer_id,
-                           int apply_defdispwin)
+                           HEVCParamSets *ps, int apply_defdispwin)
 {
     HEVCSPS *sps = ff_refstruct_alloc_ext(sizeof(*sps), 0, NULL, hevc_sps_free);
     unsigned int sps_id;
@@ -1654,7 +1608,7 @@ int ff_hevc_decode_nal_sps(GetBitContext *gb, AVCodecContext *avctx,
     }
 
     ret = ff_hevc_parse_sps(sps, gb, &sps_id,
-                            nuh_layer_id, apply_defdispwin,
+                            apply_defdispwin,
                             ps->vps_list, avctx);
     if (ret < 0)
         goto err;
@@ -2377,6 +2331,9 @@ void ff_hevc_ps_uninit(HEVCParamSets *ps)
         ff_refstruct_unref(&ps->sps_list[i]);
     for (i = 0; i < FF_ARRAY_ELEMS(ps->pps_list); i++)
         ff_refstruct_unref(&ps->pps_list[i]);
+
+    ps->sps = NULL;
+    ps->vps = NULL;
 }
 
 int ff_hevc_compute_poc(const HEVCSPS *sps, int pocTid0, int poc_lsb, int nal_unit_type)

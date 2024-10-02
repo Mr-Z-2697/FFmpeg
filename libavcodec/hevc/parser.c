@@ -102,7 +102,7 @@ static int hevc_parse_slice_header(AVCodecParserContext *s, H2645NAL *nal,
         den = sps->vui.vui_time_scale;
     }
 
-    if (num > 0 && den > 0)
+    if (num != 0 && den != 0)
         av_reduce(&avctx->framerate.den, &avctx->framerate.num,
                   num, den, 1 << 30);
 
@@ -183,7 +183,6 @@ static int parse_nal_units(AVCodecParserContext *s, const uint8_t *buf,
     HEVCParserContext *ctx = s->priv_data;
     HEVCParamSets *ps = &ctx->ps;
     HEVCSEI *sei = &ctx->sei;
-    int flags = (H2645_FLAG_IS_NALFF * !!ctx->is_avc) | H2645_FLAG_SMALL_PADDING;
     int ret, i;
 
     /* set some sane default values */
@@ -193,8 +192,8 @@ static int parse_nal_units(AVCodecParserContext *s, const uint8_t *buf,
 
     ff_hevc_reset_sei(sei);
 
-    ret = ff_h2645_packet_split(&ctx->pkt, buf, buf_size, avctx,
-                                ctx->nal_length_size, AV_CODEC_ID_HEVC, flags);
+    ret = ff_h2645_packet_split(&ctx->pkt, buf, buf_size, avctx, ctx->is_avc,
+                                ctx->nal_length_size, AV_CODEC_ID_HEVC, 1, 0);
     if (ret < 0)
         return ret;
 
@@ -210,7 +209,7 @@ static int parse_nal_units(AVCodecParserContext *s, const uint8_t *buf,
             ff_hevc_decode_nal_vps(gb, avctx, ps);
             break;
         case HEVC_NAL_SPS:
-            ff_hevc_decode_nal_sps(gb, avctx, ps, nal->nuh_layer_id, 1);
+            ff_hevc_decode_nal_sps(gb, avctx, ps, 1);
             break;
         case HEVC_NAL_PPS:
             ff_hevc_decode_nal_pps(gb, avctx, ps);

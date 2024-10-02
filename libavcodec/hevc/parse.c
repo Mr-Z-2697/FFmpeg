@@ -27,11 +27,10 @@ static int hevc_decode_nal_units(const uint8_t *buf, int buf_size, HEVCParamSets
 {
     int i;
     int ret = 0;
-    int flags = (H2645_FLAG_IS_NALFF * !!is_nalff) | H2645_FLAG_SMALL_PADDING;
     H2645Packet pkt = { 0 };
 
-    ret = ff_h2645_packet_split(&pkt, buf, buf_size, logctx,
-                                nal_length_size, AV_CODEC_ID_HEVC, flags);
+    ret = ff_h2645_packet_split(&pkt, buf, buf_size, logctx, is_nalff,
+                                nal_length_size, AV_CODEC_ID_HEVC, 1, 0);
     if (ret < 0) {
         goto done;
     }
@@ -46,8 +45,7 @@ static int hevc_decode_nal_units(const uint8_t *buf, int buf_size, HEVCParamSets
                 goto done;
             break;
         case HEVC_NAL_SPS:
-            ret = ff_hevc_decode_nal_sps(&nal->gb, logctx, ps,
-                                         nal->nuh_layer_id, apply_defdispwin);
+            ret = ff_hevc_decode_nal_sps(&nal->gb, logctx, ps, apply_defdispwin);
             if (ret < 0)
                 goto done;
             break;
