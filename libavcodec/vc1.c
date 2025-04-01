@@ -418,6 +418,10 @@ static int decode_sequence_header_adv(VC1Context *v, GetBitContext *gb)
            v->s.loop_filter, v->chromaformat, v->broadcast, v->interlace,
            v->tfcntrflag, v->finterpflag);
 
+    if (v->broadcast) { // Pulldown may be present
+        v->s.avctx->ticks_per_frame = 2;
+    }
+
     v->psf = get_bits1(gb);
     if (v->psf) { //PsF, 6.1.13
         av_log(v->s.avctx, AV_LOG_ERROR, "Progressive Segmented Frame mode: not supported (yet)\n");
