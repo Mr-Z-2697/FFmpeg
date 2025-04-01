@@ -553,7 +553,6 @@ typedef struct AVCodecContext {
      */
     AVRational framerate;
 
-    int ticks_per_frame;
     /**
      * Codec delay.
      *

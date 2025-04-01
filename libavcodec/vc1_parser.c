@@ -82,7 +82,7 @@ static void vc1_extract_headers(AVCodecParserContext *s, AVCodecContext *avctx,
             else
                 s->pict_type = vpc->v.s.pict_type;
 
-            if (avctx->ticks_per_frame > 1){
+            if (vpc->v.broadcast){
                 // process pulldown flags
                 s->repeat_pict = 1;
                 // Pulldown flags are only valid when 'broadcast' has been set.
